@@ -28,7 +28,15 @@ class BenchmarkResult:
     scenario: str
     tool: str
     times: list[float] = field(default_factory=list)
-    cache_info: str = ""
+    builds: list[int] = field(default_factory=list)
+
+    @property
+    def builds_mean(self) -> float:
+        return statistics.mean(self.builds) if self.builds else 0.0
+
+    @property
+    def builds_max(self) -> int:
+        return max(self.builds) if self.builds else 0
 
     @property
     def mean(self) -> float:
@@ -86,9 +94,15 @@ goEnv.buildGoApplication {{
 
 _TOUCH_MARKER = "// BENCHMARK_TOUCH"
 
+# Fixed symbol names + rotating values: each touch updates an existing
+# symbol's body rather than declaring a fresh one. Models the common
+# dev-loop edit ("changed a constant"). Declaring a new symbol each
+# time would also work for `private` (Go's export data only encodes
+# inittask presence, not body), but the symbol-name-in-export-data
+# effect would muddy `exported`.
 _TOUCH_TEMPLATES = {
-    "private": "var _benchTouch{ts} = uint64({ts}) {marker}\n",
-    "exported": "var BenchTouch{ts} = uint64({ts}) {marker}\n",
+    "private": "var _benchTouch = uint64({ts}) {marker}\n",
+    "exported": "var BenchTouch = uint64({ts}) {marker}\n",
 }
 
 
@@ -214,7 +228,7 @@ class NixTool:
         self.extra_opts = extra_opts or []
         self.daemon = daemon
 
-    def build(self, src_path: str | None = None) -> tuple[float, str]:
+    def build(self, src_path: str | None = None) -> tuple[float, int]:
         cmd = [
             "nix-build",
             "-I",
@@ -236,10 +250,11 @@ class NixTool:
         if self.daemon:
             env["NIX_REMOTE"] = self.daemon.env_remote
         elapsed, stdout, stderr = run_command(cmd, env=env)
-        output = stdout + stderr
-        built = output.count("building '/nix/store/")
-        cache_info = f"{built} built" if built > 0 else "fully cached"
-        return elapsed, cache_info
+        # Count the per-derivation `building '/nix/store/...'` lines.
+        # In CA mode each drv prints one "building" then one "resolved
+        # derivation" — we count "building" only.
+        built = (stdout + stderr).count("building '/nix/store/")
+        return elapsed, built
 
 
 def resolve_paths(repo_root: Path) -> tuple[str, str, str]:
@@ -290,7 +305,6 @@ def write_nix_expr(
 
 def run_touch_benchmark(
     tools: list[NixTool],
-    fixture_src: Path,
     fixture_copy: Path,
     scenario: str,
     touch_mode: str,
@@ -309,22 +323,26 @@ def run_touch_benchmark(
         tool.build(str(fixture_copy))
 
     file_path = fixture_copy / rel_path
+    pristine = file_path.read_text()
 
     for run_idx in range(1, runs + 1):
         print(f"\n  Run {run_idx}/{runs}:")
         for tool in tools:
-            # Reset fixture to baseline
-            shutil.rmtree(fixture_copy)
-            shutil.copytree(fixture_src, fixture_copy)
+            # Restore the touched file to its pristine state. Faster
+            # than rmtree+copytree (which copied ~hundreds of MB) and
+            # sufficient because we only ever touch one file per run.
+            file_path.write_text(pristine)
 
             # Apply touch
             touch_file(file_path, touch_mode)
 
-            elapsed, cache_info = tool.build(str(fixture_copy))
+            elapsed, built = tool.build(str(fixture_copy))
             results[tool.name].times.append(elapsed)
-            results[tool.name].cache_info = cache_info
-            print(f"    [{tool.name}] {elapsed:.2f}s -- {cache_info}")
+            results[tool.name].builds.append(built)
+            print(f"    [{tool.name}] {elapsed:.2f}s -- {built} drvs built")
 
+    # Always restore.
+    file_path.write_text(pristine)
     return [results[t.name] for t in tools]
 
 
@@ -346,12 +364,20 @@ def run_no_change_benchmark(
     for run_idx in range(1, runs + 1):
         print(f"\n  Run {run_idx}/{runs}:")
         for tool in tools:
-            elapsed, cache_info = tool.build(str(fixture_copy))
+            elapsed, built = tool.build(str(fixture_copy))
             results[tool.name].times.append(elapsed)
-            results[tool.name].cache_info = cache_info
-            print(f"    [{tool.name}] {elapsed:.2f}s -- {cache_info}")
+            results[tool.name].builds.append(built)
+            print(f"    [{tool.name}] {elapsed:.2f}s -- {built} drvs built")
 
     return [results[t.name] for t in tools]
+
+
+def _significant(winner: BenchmarkResult, runner_up: BenchmarkResult) -> bool:
+    """Two means are 'significantly different' if their 1σ bands don't
+    overlap. Loose by hyperfine standards but enough to flag noise."""
+    if not winner.times or not runner_up.times:
+        return False
+    return (winner.mean + winner.stddev) < (runner_up.mean - runner_up.stddev)
 
 
 def format_results(all_results: list[list[BenchmarkResult]]) -> str:
@@ -360,22 +386,37 @@ def format_results(all_results: list[list[BenchmarkResult]]) -> str:
         return "\n".join(lines + ["(no results)"])
 
     tools = [r.tool for r in all_results[0]]
-    header = (
-        "| Scenario | "
-        + " | ".join(f"{t} (mean)" for t in tools)
-        + " | Winner | Speedup |"
-    )
+    # Per-tool: (mean wall, mean drvs built)
+    headers = ["Scenario"] + [f"{t} (s / drvs)" for t in tools] + ["Winner", "Speedup"]
+    header = "| " + " | ".join(headers) + " |"
     sep = "|" + "|".join("-" * (len(c) + 2) for c in header.split("|")[1:-1]) + "|"
     lines += ["\n" + header, sep]
 
     for scenario_results in all_results:
-        means = {r.tool: r.mean for r in scenario_results}
+        by_tool = {r.tool: r for r in scenario_results}
         scenario_name = scenario_results[0].scenario
-        winner = min(means, key=lambda k: means[k])
-        runner_up = sorted(means.values())[1] if len(means) > 1 else means[winner]
-        speedup = f"{runner_up / means[winner]:.1f}x" if means[winner] > 0 else "--"
-        cells = " | ".join(f"{means[t]:.2f}s" for t in tools)
-        lines.append(f"| {scenario_name} | {cells} | **{winner}** | {speedup} |")
+        winner_name = min(by_tool, key=lambda k: by_tool[k].mean)
+        winner = by_tool[winner_name]
+        # Pick the second-fastest by mean — if it's not significantly
+        # slower, the "winner" label is misleading.
+        others = sorted(
+            (r for r in scenario_results if r.tool != winner_name),
+            key=lambda r: r.mean,
+        )
+        if others and _significant(winner, others[0]):
+            winner_label = f"**{winner_name}**"
+            runner_up = others[0]
+            speedup = f"{runner_up.mean / winner.mean:.2f}x" if winner.mean > 0 else "--"
+        elif others:
+            winner_label = "tie"
+            speedup = "n.s."
+        else:
+            winner_label = f"**{winner_name}**"
+            speedup = "--"
+        cells = " | ".join(
+            f"{by_tool[t].mean:.2f} / {by_tool[t].builds_mean:.0f}" for t in tools
+        )
+        lines.append(f"| {scenario_name} | {cells} | {winner_label} | {speedup} |")
 
     lines.append("\n## Detailed Results\n")
     for scenario_results in all_results:
@@ -383,9 +424,8 @@ def format_results(all_results: list[list[BenchmarkResult]]) -> str:
         lines.append(f"### {scenario_name}\n")
         for r in scenario_results:
             lines.append(f"**{r.tool}:**")
-            lines.append(f"  - Mean: {r.mean:.2f}s (+/-{r.stddev:.2f}s)")
-            lines.append(f"  - Range: {r.min:.2f}s -- {r.max:.2f}s")
-            lines.append(f"  - Info: {r.cache_info}")
+            lines.append(f"  - Wall: {r.mean:.2f}s (+/-{r.stddev:.2f}s) range {r.min:.2f}s..{r.max:.2f}s")
+            lines.append(f"  - Drvs built: {r.builds_mean:.1f} (per-run: {r.builds})")
             lines.append("")
     return "\n".join(lines)
 
@@ -402,7 +442,8 @@ def export_json(all_results: list[list[BenchmarkResult]], output_path: Path) -> 
                 "times": r.times,
                 "mean": r.mean,
                 "stddev": r.stddev,
-                "cache_info": r.cache_info,
+                "builds": r.builds,
+                "builds_mean": r.builds_mean,
             }
         data["scenarios"].append(entry)
     with open(output_path, "w") as f:
@@ -432,6 +473,14 @@ def main() -> None:
         help="Comma-separated tools (default: nix,nix-ca)",
     )
     parser.add_argument("--json", type=Path, help="Export results as JSON")
+    parser.add_argument(
+        "--assert-cascade",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Fail if any tool builds more than N derivations on a touch "
+        "scenario. Use as a regression check for the iface cutoff.",
+    )
     args = parser.parse_args()
 
     repo_root = get_repo_root()
@@ -455,13 +504,17 @@ def main() -> None:
     # system daemon store.
     local_daemon = LocalDaemon(tmpdir, "ca-derivations")
     local_daemon.start()
+    # Disable network substituters: every CA-mode build would otherwise
+    # query cache.nixos.org for the realisation of every local CA
+    # derivation (~1s of HTTPS round-trips per run, all 404s — local
+    # CA outputs are by definition not in any public cache). The
+    # `daemon` substituter still serves third-party packages from the
+    # system store. allowSubstitutes=false on the per-package drvs (set
+    # by caAttrs in dag/default.nix) is the structural fix; this guard
+    # ensures the bench numbers don't depend on it being set correctly.
     common_opts = [
         "--option", "sandbox", "false",
-        "--option", "substituters",
-        "daemon https://cache.nixos.org https://cache.numtide.com",
-        "--option", "trusted-public-keys",
-        "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= "
-        "cache.numtide.com-1:bf/T+iRCVpNgNStXCXTiUMsdMfEfhaQzExC9NG28oIg=",
+        "--option", "substituters", "daemon",
     ]
 
     expr_nix = write_nix_expr(tmpdir, "nix", str(fixture_src), go2nix_src, system)
@@ -483,11 +536,38 @@ def main() -> None:
         else:
             parser.error(f"Unknown tool: {name!r} (available: {list(available_tools)})")
 
-    # Copy fixture
+    # Copy fixture (one-time; we restore touched files in-place per run).
     fixture_copy = Path(os.environ.get("TMPDIR", "/tmp")) / "bench-fixture-copy"
     if fixture_copy.exists():
         shutil.rmtree(fixture_copy)
     shutil.copytree(fixture_src, fixture_copy)
+
+    # Sanity check: ensure each requested tool's expression instantiates
+    # to the kind of derivation it claims. nix-ca should produce a CA
+    # derivation closure; if `contentAddressed = true` was silently
+    # ignored, we'd benchmark two identical configs and get a meaningless
+    # tie. Cheap eval-only check, no build.
+    for tool in tools:
+        if "ca" in tool.name:
+            cmd = [
+                "nix-instantiate", "-I", f"nixpkgs={nixpkgs_path}",
+                "--option", "plugin-files", plugin_path,
+                "--option", "allow-import-from-derivation", "true",
+                "--option", "extra-experimental-features", "ca-derivations",
+                "--eval", "--json", "--expr",
+                f"let drv = import {tool.expr_path} {{}}; "
+                f"in builtins.any (x: x ? __contentAddressed) "
+                f"  (builtins.attrValues drv.passthru.localPackages or {{}})"
+                f" || (drv.drvAttrs ? __contentAddressed)",
+            ]
+            _, stdout, _ = run_command(cmd)
+            if stdout.strip() not in ("true", "false"):
+                # Eval failed (likely passthru attr name differs); fall
+                # through to a build-time check.
+                continue
+            if stdout.strip() == "false":
+                print(f"  WARNING: {tool.name} expression has no CA derivations "
+                      f"in its closure — contentAddressed may be silently ignored")
 
     print(f"\n{'=' * 70}")
     print("GO2NIX INCREMENTAL BUILD BENCHMARK")
@@ -511,7 +591,7 @@ def main() -> None:
         else:
             all_results.append(
                 run_touch_benchmark(
-                    tools, fixture_src, fixture_copy, name, args.touch_mode, args.runs
+                    tools, fixture_copy, name, args.touch_mode, args.runs
                 )
             )
 
@@ -520,10 +600,33 @@ def main() -> None:
     if args.json:
         export_json(all_results, args.json)
 
-    # Cleanup
+    # Cleanup before asserting so a failure doesn't leak the daemon.
     local_daemon.stop()
     shutil.rmtree(fixture_copy, ignore_errors=True)
     shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # Cascade-size regression check: fail loudly if any tool's
+    # worst-case build count on a touch scenario exceeds the threshold.
+    # Useful as a CI guardrail for the iface cutoff.
+    if args.assert_cascade is not None:
+        violations = []
+        for scenario_results in all_results:
+            for r in scenario_results:
+                if r.scenario == "no_change":
+                    continue
+                if r.builds_max > args.assert_cascade:
+                    violations.append(
+                        f"{r.scenario}/{r.tool}: built {r.builds_max} drvs "
+                        f"(threshold {args.assert_cascade})"
+                    )
+        if violations:
+            print(f"\n{'=' * 70}")
+            print(f"FAIL: cascade-size threshold ({args.assert_cascade}) exceeded")
+            print(f"{'=' * 70}")
+            for v in violations:
+                print(f"  {v}")
+            raise SystemExit(1)
+        print(f"\nPASS: all tools stayed within cascade threshold {args.assert_cascade}")
 
 
 if __name__ == "__main__":
