@@ -57,6 +57,15 @@
   # rebuilds producing byte-identical outputs short-circuit downstream
   # recompiles. Requires the ca-derivations experimental feature; the
   # final binary stays input-addressed.
+  #
+  # Each per-package derivation gets a separate `iface` output containing
+  # only the export data (.x file via go tool compile -linkobj).
+  # Downstream compiles depend on `iface`, so private-symbol changes
+  # which alter the .a but not its export data don't cascade. The two
+  # mechanisms are coupled by design — CA without iface only short-
+  # circuits comment-only and cross-module-boundary edits, while iface
+  # without CA can't cut off anything (the input-addressed .x path
+  # changes whenever src does).
   contentAddressed ? false,
   # Phase 1: checks only supported for modRoot == "." (single-module case).
   # When modRoot != ".", mainSrc doesn't include local replace targets outside
@@ -80,17 +89,35 @@ let
     # path-substitution and the drv-output-substitution goals.
     allowSubstitutes = false;
   };
+  ifaceAttrs = lib.optionalAttrs contentAddressed {
+    outputs = [
+      "out"
+      "iface"
+    ];
+  };
   # caOnly: CA without the iface output — for importcfg bundles.
-  # caMk: CA — for per-package compiles. Third-party packages stay
-  # input-addressed (fixed source, never rebuild — CA adds resolution
+  # caMk: CA + iface split — for per-package compiles. Third-party packages
+  # stay input-addressed (fixed source, never rebuild — CA adds resolution
   # overhead without benefit).
-  caMk = mk: attrs: mk (attrs // caAttrs);
+  caOnly = mk: attrs: mk (attrs // caAttrs);
+  caMk = mk: attrs: mk (attrs // caAttrs // ifaceAttrs);
   # Non-cgo packages use a raw derivation (no stdenv, no phase machinery)
   # for faster per-package compiles. Cgo packages need cc-wrapper from stdenv.
   pickMk = isCgo: if isCgo then stdenv.mkDerivation else rawGoCompile;
 
   # Where to find a dep's importcfg fragment for downstream compiles.
-  depCompileCfg = dep: "${dep}/importcfg";
+  # When CA is on, local packages have it in the iface output (points at
+  # the .x file); third-party packages have a single output and the
+  # importcfg points at the .a (which contains __.PKGDEF).
+  depCompileCfg = dep: "${dep.iface or dep}/importcfg";
+
+  # buildInputs for per-package compiles must reference ONLY the iface
+  # output when CA is on — referencing the full derivation pulls in
+  # `out` (.a link object) too, which changes whenever the body changes,
+  # defeating the iface cutoff. The actual file dependency is already
+  # captured via string context in compileManifestJSON; buildInputs here
+  # is just for the stdenv input closure.
+  depBuildInput = dep: dep.iface or dep;
 
   # Raw-derivation builder for pure-Go packages: bypasses stdenv
   # entirely (no setup.sh, no phase machinery). The go2nix CLI just
@@ -131,6 +158,7 @@ let
       # machinery we're bypassing. The dep edges are carried via string
       # context in env.compileManifestJSON.
       passthrough = lib.getAttrs (lib.intersectLists (lib.attrNames attrs) [
+        "outputs"
         "__contentAddressed"
         "outputHashMode"
         "outputHashAlgo"
@@ -333,7 +361,7 @@ let
       __structuredAttrs = true;
 
       nativeBuildInputs = [ hooks.goModuleHook ] ++ cgoBuildInputs ++ extraNativeBuildInputs;
-      buildInputs = deps;
+      buildInputs = map depBuildInput deps;
 
       env = mkCompileEnv {
         inherit
@@ -441,7 +469,7 @@ let
       __structuredAttrs = true;
 
       nativeBuildInputs = [ hooks.goModuleHook ] ++ cgoBuildInputs ++ extraNativeBuildInputs;
-      buildInputs = deps;
+      buildInputs = map depBuildInput deps;
 
       env = mkCompileEnv {
         inherit
@@ -549,7 +577,7 @@ let
         __structuredAttrs = true;
 
         nativeBuildInputs = [ hooks.goModuleHook ] ++ cgoBuildInputs ++ extraNativeBuildInputs;
-        buildInputs = deps;
+        buildInputs = map depBuildInput deps;
 
         env = mkCompileEnv {
           inherit
@@ -674,6 +702,10 @@ let
       kind = "link";
       importcfgParts = [ "${depsImportcfg}/importcfg" ];
       localArchives = builtins.mapAttrs (importPath: pkg: "${pkg}/${importPath}.a") localPackages;
+    }
+    // lib.optionalAttrs contentAddressed {
+      compileImportcfgParts = [ "${depsImportcfg}/importcfg" ];
+      localIfaces = builtins.mapAttrs (importPath: pkg: "${pkg.iface}/${importPath}.x") localPackages;
     }
     // {
       subPackages = normalizedSubPackages;
